@@ -1,0 +1,10 @@
+.apikey
+*.pyc
+__pycache__/
+*.json
+*.jsonl
+*.log
+*.csv
+*.db
+*.sqlite
+*.env

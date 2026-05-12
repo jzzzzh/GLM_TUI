@@ -60,6 +60,7 @@ class MemoryStore:
         self.data: Dict[str, Any] = read_json(
             self.path,
             {
+                "profile": {},
                 "preferences": {},
                 "notes": {},
                 "recaps": [],
@@ -93,6 +94,28 @@ class MemoryStore:
             self.save()
         return removed
 
+    def set_profile(self, key: str, value: str) -> None:
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            raise ValueError("配置键不能为空")
+        profile = self.data.setdefault("profile", {})
+        if not isinstance(profile, dict):
+            profile = {}
+            self.data["profile"] = profile
+        if value:
+            profile[key] = value
+        else:
+            profile.pop(key, None)
+        self.save()
+
+    def get_profile(self, key: str, default: str = "") -> str:
+        profile = self.data.get("profile", {})
+        if not isinstance(profile, dict):
+            return default
+        value = profile.get(key, default)
+        return str(value).strip()
+
     def add_recap(self, text: str) -> None:
         text = text.strip()
         if not text:
@@ -113,6 +136,18 @@ class MemoryStore:
 
     def summary(self, max_items: int = 12) -> str:
         lines: List[str] = []
+        profile = self.data.get("profile", {})
+        if isinstance(profile, dict) and profile:
+            lines.append("个性化设定：")
+            assistant_name = str(profile.get("assistant_name", "")).strip()
+            user_name = str(profile.get("user_name", "")).strip()
+            personality = str(profile.get("personality", "")).strip()
+            if assistant_name:
+                lines.append(f"- 助手名字: {assistant_name}")
+            if user_name:
+                lines.append(f"- 用户名字: {user_name}")
+            if personality:
+                lines.append(f"- 回答风格: {personality}")
         preferences = self.data.get("preferences", {})
         if isinstance(preferences, dict) and preferences:
             lines.append("用户偏好：")

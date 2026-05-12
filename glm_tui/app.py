@@ -32,14 +32,30 @@ from .storage import MemoryStore, SessionStore, format_paths, redact_secrets
 
 
 TASK_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+)$")
+ASSISTANT_NAME_PATTERNS = (
+    re.compile(r"(?:把)?(?:你的名字|你名字|助手名字)(?:改成|改为|设为|设置为|叫做|叫)\s*([^，,。.!！?？\n]+)"),
+    re.compile(r"(?:你以后|以后你|从现在起你)(?:就)?叫\s*([^，,。.!！?？\n]+)"),
+    re.compile(r"以后叫你\s*([^，,。.!！?？\n]+)"),
+    re.compile(r"^你叫\s*([^，,。.!！?？\n]+)"),
+)
+USER_NAME_PATTERNS = (
+    re.compile(r"(?:我的名字|我名字)(?:是|叫|改成|改为|设为|设置为)\s*([^，,。.!！?？\n]+)"),
+    re.compile(r"(?:以后|以后请|请)?叫我\s*([^，,。.!！?？\n]+)"),
+)
+PERSONA_PATTERNS = (
+    re.compile(r"(?:回答风格|你的风格|个性|性格)(?:改成|改为|设为|设置为|是)\s*([^，,。.!！?？\n]+)"),
+    re.compile(r"(?:以后|之后)(?:请)?(?:用|以)\s*([^，,。.!！?？\n]+?)(?:的)?(?:风格|语气)(?:回答|说话)?"),
+    re.compile(r"(?:个性化|偏好)(?:设置|修改|改成|改为|设为)\s*([^，,。.!！?？\n]+)"),
+)
 THEMES = ["墨绿", "深海", "纸墨", "霓虹"]
 
 
 class MessageBubble(Static):
-    def __init__(self, role: str, body: str):
+    def __init__(self, role: str, body: str, assistant_name: str = "GLM"):
         super().__init__()
         self.role = role
         self.body = body
+        self.assistant_name = assistant_name
         self.add_class(f"role-{role}")
 
     def on_mount(self) -> None:
@@ -47,7 +63,7 @@ class MessageBubble(Static):
 
     def set_body(self, body: str) -> None:
         self.body = body
-        title = {"user": "◇ 你", "assistant": "✦ GLM", "system": "◆ 系统"}.get(self.role, self.role)
+        title = {"user": "◇ 你", "assistant": f"✦ {self.assistant_name}", "system": "◆ 系统"}.get(self.role, self.role)
         border = {"user": "#70d6ff", "assistant": "#8cffc1", "system": "#ffd166"}.get(self.role, "white")
         self.update(
             Panel(
@@ -236,6 +252,7 @@ class GLMTuiApp(App[None]):
         self.pending_edit: Optional[EditPreview] = None
         self.pending_user_input = ""
         self.pending_intent = "code"
+        self.memory_sync_task: Optional[asyncio.Task[None]] = None
         self.activity_frames = ["✦", "✧", "◆", "◇", "◈", "◇", "◆", "✧"]
         self.mascot_frames = ["(•‿•)", "(•◡•)", "(•ᴗ•)", "(•ᵕ•)", "(•◡•)"]
         self.loading_phrases = ["整理上下文", "读取记忆", "守护写入", "等待指令", "检查风险"]
@@ -268,8 +285,46 @@ class GLMTuiApp(App[None]):
         self._refresh_mascot()
         self.query_one("#composer", Input).focus()
         self.retrieval.rebuild_turns(self.logs.read_all())
-        asyncio.create_task(self._sync_memory_background(show_empty=False))
+        self._schedule_memory_sync(show_empty=False)
+        self.set_interval(60, self._autosave)
         self.set_interval(0.25, self._tick_activity)
+
+    async def on_unmount(self) -> None:
+        self._save_state()
+
+    def _save_state(self) -> None:
+        self.sessions.save(self.session)
+
+    def _autosave(self) -> None:
+        self._save_state()
+        self._refresh_status("已自动保存")
+
+    def _schedule_memory_sync(self, show_empty: bool) -> None:
+        if self.memory_sync_task and not self.memory_sync_task.done():
+            return
+        self.memory_sync_task = asyncio.create_task(self._sync_memory_background(show_empty=show_empty))
+
+    async def _ensure_memory_current(self) -> None:
+        if self.memory_sync_task and not self.memory_sync_task.done():
+            await self.memory_sync_task
+            return
+        await self._sync_memory_background(show_empty=False)
+
+    async def _animate_until_done(
+        self,
+        task: asyncio.Task[None],
+        bubble: MessageBubble,
+        steps: List[str],
+    ) -> None:
+        index = 0
+        while not task.done():
+            marker = self.activity_frames[index % len(self.activity_frames)]
+            step = steps[index % len(steps)]
+            bubble.set_body(f"{marker} {step}中，请稍候...")
+            self._refresh_status(step + "中")
+            index += 1
+            await asyncio.sleep(0.25)
+        await task
 
     async def _render_existing_session(self) -> None:
         if self.session.messages:
@@ -280,7 +335,7 @@ class GLMTuiApp(App[None]):
             await self._notice("欢迎使用 GLM 中文 TUI。输入 `/help` 查看命令，输入普通文字开始对话。")
 
     async def _mount_message(self, role: str, body: str) -> MessageBubble:
-        bubble = MessageBubble(role, redact_secrets(body))
+        bubble = MessageBubble(role, redact_secrets(body), self.memory.get_profile("assistant_name", "GLM"))
         chat = self.query_one("#chat", VerticalScroll)
         await chat.mount(bubble)
         chat.scroll_end(animate=False)
@@ -397,6 +452,9 @@ class GLMTuiApp(App[None]):
             "memory": self._cmd_memory,
             "remember": self._cmd_remember,
             "forget": self._cmd_forget,
+            "name": self._cmd_name,
+            "user": self._cmd_user,
+            "persona": self._cmd_persona,
             "add": self._cmd_add,
             "read": self._cmd_read,
             "grep": self._cmd_grep,
@@ -632,6 +690,39 @@ class GLMTuiApp(App[None]):
         self._refresh_sidebars()
         await self._notice("已删除该记忆。" if removed else "没有找到这个记忆键。")
 
+    async def _cmd_name(self, args: str) -> None:
+        name = args.strip()
+        if not name:
+            current = self.memory.get_profile("assistant_name", "GLM")
+            await self._notice(f"当前助手名字：`{current}`。用法：`/name 小智`")
+            return
+        self.memory.set_profile("assistant_name", name)
+        self.memory.remember("助手名字", name)
+        self._refresh_sidebars()
+        await self._notice(f"已把助手名字改为：`{name}`。以后我会按这个名字自称。")
+
+    async def _cmd_user(self, args: str) -> None:
+        name = args.strip()
+        if not name:
+            current = self.memory.get_profile("user_name", "")
+            await self._notice(f"当前用户名字：`{current or '未设置'}`。用法：`/user 张三`")
+            return
+        self.memory.set_profile("user_name", name)
+        self.memory.remember("用户名字", name)
+        self._refresh_sidebars()
+        await self._notice(f"已记住用户名字：`{name}`。")
+
+    async def _cmd_persona(self, args: str) -> None:
+        persona = args.strip()
+        if not persona:
+            current = self.memory.get_profile("personality", "")
+            await self._notice(f"当前回答风格：`{current or '未设置'}`。用法：`/persona 简洁、直接、少废话`")
+            return
+        self.memory.set_profile("personality", persona)
+        self.memory.remember("回答风格", persona)
+        self._refresh_sidebars()
+        await self._notice(f"已更新回答风格：`{persona}`。")
+
     async def _cmd_add(self, args: str) -> None:
         if not args:
             await self._notice("用法：`/add test.py`。")
@@ -833,7 +924,20 @@ class GLMTuiApp(App[None]):
         await self._notice(f"主题已切换为：`{name}`。")
 
     async def _cmd_quit(self, _: str) -> None:
-        self.sessions.save(self.session)
+        self._save_state()
+        bubble = await self._notice("正在保存会话和整理记忆，请稍候...")
+        if self.memory_sync_task and not self.memory_sync_task.done():
+            sync_task = self.memory_sync_task
+        else:
+            sync_task = asyncio.create_task(self._sync_memory_background(show_empty=False))
+            self.memory_sync_task = sync_task
+        await self._animate_until_done(
+            sync_task,
+            bubble,
+            ["保存会话", "整理记忆", "写入历史", "准备退出"],
+        )
+        bubble.set_body("保存完成，正在退出...")
+        await asyncio.sleep(0.2)
         self.exit()
 
     async def _add_context_file(self, raw_path: str) -> None:
@@ -850,6 +954,8 @@ class GLMTuiApp(App[None]):
         await self._notice(f"已加入只读上下文：`{item.path}`。")
 
     async def _send_user_message(self, text: str) -> None:
+        if await self._handle_personalization_message(text):
+            return
         assistant_bubble: Optional[MessageBubble] = None
         answer = ""
         intent = classify_intent(text, self.session.mode, self.session.rag_enabled)
@@ -859,9 +965,14 @@ class GLMTuiApp(App[None]):
         try:
             self._add_mentions_to_context(text)
             self.session.add_message("user", text)
+            self._save_state()
             await self._mount_message("user", text)
             assistant_bubble = await self._mount_message("assistant", "正在思考...")
             self._refresh_status("生成中")
+
+            if intent.kind in {"memory_summary", "memory_detail"}:
+                self._refresh_status("同步记忆中")
+                await self._ensure_memory_current()
 
             messages = self.session.api_messages(self._system_prompt(self._rag_context_for(text, intent)))
             if self.session.stream:
@@ -892,14 +1003,18 @@ class GLMTuiApp(App[None]):
             assistant_bubble.set_body(answer)
             self.session.add_message("assistant", answer)
             self._extract_tasks(answer)
-            self.sessions.save(self.session)
+            self._save_state()
             record = self._log_turn(text, answer, intent.kind, None)
             self.retrieval.upsert_turn(record)
+            self._schedule_memory_sync(show_empty=False)
             self._refresh_sidebars()
             self._refresh_status("完成")
         except asyncio.CancelledError:
+            cancelled_answer = (answer or "生成已取消。").rstrip() + "\n\n（已取消）"
             if assistant_bubble:
-                assistant_bubble.set_body((answer or "生成已取消。").rstrip() + "\n\n（已取消）")
+                assistant_bubble.set_body(cancelled_answer)
+            self.session.add_message("assistant", cancelled_answer)
+            self._save_state()
             self._refresh_status("已取消")
         except GLMAPIError as exc:
             if assistant_bubble:
@@ -909,11 +1024,74 @@ class GLMTuiApp(App[None]):
             self.current_task = None
             self.query_one("#composer", Input).focus()
 
+    async def _handle_personalization_message(self, text: str) -> bool:
+        updates = self._extract_personalization_updates(text)
+        if not updates:
+            return False
+
+        self.session.add_message("user", text)
+        self._save_state()
+        await self._mount_message("user", text)
+
+        lines = []
+        assistant_name = updates.get("assistant_name")
+        user_name = updates.get("user_name")
+        personality = updates.get("personality")
+        if assistant_name:
+            self.memory.set_profile("assistant_name", assistant_name)
+            self.memory.remember("助手名字", assistant_name)
+            lines.append(f"- 助手名字已改为：`{assistant_name}`")
+        if user_name:
+            self.memory.set_profile("user_name", user_name)
+            self.memory.remember("用户名字", user_name)
+            lines.append(f"- 用户名字已记住：`{user_name}`")
+        if personality:
+            self.memory.set_profile("personality", personality)
+            self.memory.remember("回答风格", personality)
+            lines.append(f"- 回答风格已更新：`{personality}`")
+
+        answer = "已保存个性化设置：\n\n" + "\n".join(lines)
+        await self._mount_message("assistant", answer)
+        self.session.add_message("assistant", answer)
+        self._save_state()
+        record = self._log_turn(text, answer, "personalization", None)
+        self.retrieval.upsert_turn(record)
+        self._refresh_sidebars()
+        self._refresh_status("已保存个性化设置")
+        self._refresh_mascot()
+        self.query_one("#composer", Input).focus()
+        return True
+
+    def _extract_personalization_updates(self, text: str) -> Dict[str, str]:
+        updates: Dict[str, str] = {}
+        for key, patterns in (
+            ("assistant_name", ASSISTANT_NAME_PATTERNS),
+            ("user_name", USER_NAME_PATTERNS),
+            ("personality", PERSONA_PATTERNS),
+        ):
+            for pattern in patterns:
+                match = pattern.search(text)
+                if match:
+                    value = self._clean_personalization_value(match.group(1))
+                    if value:
+                        updates[key] = value
+                        break
+        return updates
+
+    def _clean_personalization_value(self, value: str) -> str:
+        cleaned = value.strip().strip("`'\"“”‘’")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"(?:吧|哈|哦|呀|谢谢|可以吗|行吗)$", "", cleaned).strip()
+        if cleaned in {"什么", "啥", "谁", "哪位"}:
+            return ""
+        return cleaned[:80]
+
     async def _send_code_message(self, text: str, intent: Intent) -> None:
         assistant_bubble: Optional[MessageBubble] = None
         try:
             self._add_mentions_to_context(text)
             self.session.add_message("user", text)
+            self._save_state()
             await self._mount_message("user", text)
             assistant_bubble = await self._mount_message("assistant", "代码代理正在生成编辑计划...")
             self._refresh_status("代码代理生成中")
@@ -953,7 +1131,7 @@ class GLMTuiApp(App[None]):
             answer = self._format_preview(preview)
             assistant_bubble.set_body(answer)
             self.session.add_message("assistant", answer)
-            self.sessions.save(self.session)
+            self._save_state()
             self._refresh_sidebars()
             self._refresh_status("等待审批")
             self._refresh_mascot()
@@ -1093,9 +1271,10 @@ class GLMTuiApp(App[None]):
         if notes:
             answer += "\n\n" + "\n".join(notes)
         self.session.add_message("assistant", answer)
-        self.sessions.save(self.session)
+        self._save_state()
         record = self._log_turn(self.pending_user_input, answer, self.pending_intent, change.change_id)
         self.retrieval.upsert_turn(record)
+        self._schedule_memory_sync(show_empty=False)
         self.pending_user_input = ""
         self._refresh_sidebars()
         self._refresh_status("已应用审批变更")
@@ -1169,7 +1348,11 @@ class GLMTuiApp(App[None]):
             return ""
         detailed = intent.kind == "memory_detail"
         if intent.kind in {"memory_summary", "memory_detail"}:
-            return self.memory_manager.context_for_query(text, self.retrieval, detailed=detailed)
+            blocks = [self.memory_manager.context_for_query(text, self.retrieval, detailed=detailed)]
+            recent_history = self._recent_history_context(limit=8 if detailed else 5)
+            if recent_history:
+                blocks.append(recent_history)
+            return "\n\n".join(block for block in blocks if block)
         hits = self.retrieval.search_segments(text, limit=3)
         if not hits:
             return ""
@@ -1177,12 +1360,43 @@ class GLMTuiApp(App[None]):
             f"[mem:{hit.item_id}] {hit.content[:600]}" for hit in hits
         )
 
+    def _recent_history_context(self, limit: int = 6) -> str:
+        records = self.logs.read_all(limit=limit)
+        if not records:
+            return ""
+        blocks = []
+        for record in records:
+            blocks.append(
+                f"[log:{record.session_id}:{record.turn_id}]\n"
+                f"时间：{record.created_at}\n"
+                f"用户：{record.user_input}\n"
+                f"助手：{record.assistant_output[:900]}"
+            )
+        return (
+            "## 最近原始对话历史\n"
+            "用户询问上一轮、刚才、问过什么、聊天记录或历史记录时，优先依据这些原始日志回答。\n\n"
+            + "\n\n".join(blocks)
+        )
+
     def _system_prompt(self, rag_context: str = "") -> str:
+        assistant_name = self.memory.get_profile("assistant_name", "GLM")
+        user_name = self.memory.get_profile("user_name", "")
+        personality = self.memory.get_profile("personality", "")
         parts = [
-            "你是一个运行在中文 TUI 里的 GLM 编程助手。",
+            f"你是一个运行在中文 TUI 里的 GLM 编程助手。你的当前名字是：{assistant_name}。",
             "你需要用中文回答，风格直接、清晰、务实。",
             "当前能力边界：普通聊天可以阅读上下文；代码代理模式会单独应用结构化编辑。",
+            (
+                "当用户问“你能干什么”“有什么功能”“会什么”“怎么用”等能力介绍类问题时，"
+                "请直接用大模型自然回答你在这个 TUI 中能做的事：中文问答、代码解释和方案分析、"
+                "读取用户加入的项目文件上下文、搜索/查看本地对话日志、使用长期记忆、生成会话摘要、"
+                "在代码代理模式下生成待审批的代码修改方案，并提醒可输入 `/help` 查看全部命令。"
+            ),
         ]
+        if user_name:
+            parts.append(f"当前用户名字是：{user_name}。合适时可用这个名字称呼用户。")
+        if personality:
+            parts.append(f"用户设置的回答风格：{personality}。在不损害准确性和安全性的前提下遵守。")
         memory_summary = self.memory.summary()
         if memory_summary:
             parts.append("长期记忆：\n" + memory_summary)
@@ -1384,6 +1598,7 @@ class GLMTuiApp(App[None]):
         self._refresh_status("主题已切换")
 
     def action_cancel_generation(self) -> None:
+        self._save_state()
         if self.current_task and not self.current_task.done():
             self.current_task.cancel()
             self._refresh_status("正在取消")
@@ -1421,4 +1636,8 @@ class GLMTuiApp(App[None]):
 
 
 def run() -> None:
-    GLMTuiApp().run()
+    app = GLMTuiApp()
+    try:
+        app.run()
+    finally:
+        app._save_state()
