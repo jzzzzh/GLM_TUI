@@ -15,7 +15,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
-from textual.widgets import Footer, Header, Input, Static
+from textual.widgets import Collapsible, Footer, Header, Input, Static
 
 from .api import GLMAPIError, GLMClient
 from .checkpoints import CheckpointStore
@@ -344,6 +344,21 @@ class GLMTuiApp(App[None]):
     async def _notice(self, body: str) -> MessageBubble:
         return await self._mount_message("system", body)
 
+    async def _mount_collapsible(self, title: str, body: str, collapsed: bool = True) -> None:
+        content = Static(
+            Panel(
+                Markdown(body or " "),
+                border_style="#7ec8ff",
+                box=box.ROUNDED,
+                padding=(0, 1),
+                expand=True,
+            )
+        )
+        panel = Collapsible(content, title=title, collapsed=collapsed)
+        chat = self.query_one("#chat", VerticalScroll)
+        await chat.mount(panel)
+        chat.scroll_end(animate=False)
+
     @on(Input.Submitted, "#composer")
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -455,6 +470,10 @@ class GLMTuiApp(App[None]):
             "name": self._cmd_name,
             "user": self._cmd_user,
             "persona": self._cmd_persona,
+            "search": self._cmd_search,
+            "image": self._cmd_image,
+            "video": self._cmd_video,
+            "result": self._cmd_result,
             "add": self._cmd_add,
             "read": self._cmd_read,
             "grep": self._cmd_grep,
@@ -491,7 +510,9 @@ class GLMTuiApp(App[None]):
             )
             await self._notice(f"## 可选模型\n\n{models}\n\n也可以输入自定义模型名：`/model your-model`。")
             return
-        self.session.model = args.strip()
+        requested = args.strip()
+        normalized = requested.lower()
+        self.session.model = normalized if normalized in SUPPORTED_MODELS else requested
         self.memory.set_last_model(self.session.model)
         self.sessions.save(self.session)
         self._refresh_sidebars()
@@ -722,6 +743,251 @@ class GLMTuiApp(App[None]):
         self.memory.remember("回答风格", persona)
         self._refresh_sidebars()
         await self._notice(f"已更新回答风格：`{persona}`。")
+
+    async def _cmd_search(self, args: str) -> None:
+        query = args.strip()
+        if not query:
+            await self._notice("用法：`/search 关键词`，例如 `/search GLM-5.1 最新能力`。")
+            return
+        query = query[:70]
+        user_text = f"/search {query}"
+        self.session.add_message("user", user_text)
+        self._save_state()
+        await self._mount_message("user", user_text)
+        bubble = await self._mount_message("assistant", "正在联网搜索...")
+        self._refresh_status("搜索中")
+        try:
+            search_data = await self.client.web_search(query=query, count=8)
+            results = search_data.get("search_result", [])
+            if not isinstance(results, list) or not results:
+                bubble.set_body("没有搜索到可用结果。")
+                self._refresh_status("搜索无结果")
+                return
+            search_context = self._format_search_context(results)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        self._system_prompt()
+                        + "\n\n你正在根据联网搜索结果回答。请优先依据搜索结果，"
+                        "保留关键来源编号；信息不足时明确说明。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"问题：{query}\n\n搜索结果：\n{search_context}",
+                },
+            ]
+            event = await self.client.complete_once(
+                model=self.session.model,
+                messages=messages,
+                temperature=self.session.temperature,
+                thinking=self.session.thinking,
+            )
+            answer = (event.content or "（模型没有返回内容）").strip()
+            sources = self._format_search_results(results)
+            body = answer + "\n\n_搜索来源已折叠显示在下方。_"
+            saved_body = answer + "\n\n## 搜索结果\n\n" + sources
+            bubble.set_body(body)
+            await self._mount_collapsible("搜索结果", sources, collapsed=True)
+            self.session.add_message("assistant", saved_body)
+            if event.usage:
+                self.session.usage = event.usage
+            self._save_state()
+            record = self._log_turn(user_text, saved_body, "search", None)
+            self.retrieval.upsert_turn(record)
+            self._schedule_memory_sync(show_empty=False)
+            self._refresh_sidebars()
+            self._refresh_status("搜索完成")
+        except GLMAPIError as exc:
+            bubble.set_body("搜索失败：\n\n" + redact_secrets(str(exc)))
+            self._refresh_status("搜索失败")
+
+    async def _cmd_image(self, args: str) -> None:
+        prompt = args.strip()
+        if not prompt:
+            await self._notice("用法：`/image 一只可爱的小猫咪`。")
+            return
+        await self._submit_generation_task(
+            command="image",
+            prompt=prompt,
+            pending_text="正在提交图片生成任务...",
+        )
+
+    async def _cmd_video(self, args: str) -> None:
+        prompt = args.strip()
+        if not prompt:
+            await self._notice("用法：`/video A cat is playing with a ball.`。")
+            return
+        await self._submit_generation_task(
+            command="video",
+            prompt=prompt[:512],
+            pending_text="正在提交视频生成任务...",
+        )
+
+    async def _submit_generation_task(self, command: str, prompt: str, pending_text: str) -> None:
+        user_text = f"/{command} {prompt}"
+        self.session.add_message("user", user_text)
+        self._save_state()
+        await self._mount_message("user", user_text)
+        bubble = await self._mount_message("assistant", pending_text)
+        self._refresh_status("提交生成任务")
+        try:
+            if command == "image":
+                data = await self.client.generate_image(prompt=prompt)
+                label = "图片"
+            else:
+                data = await self.client.generate_video(prompt=prompt)
+                label = "视频"
+            task_id = str(data.get("id") or "-")
+            status = str(data.get("task_status") or "-")
+            request_id = str(data.get("request_id") or "-")
+            model = str(data.get("model") or ("glm-image" if command == "image" else "cogvideox-3"))
+            body = (
+                f"## {label}生成任务已提交\n\n"
+                f"- 模型：`{model}`\n"
+                f"- 任务 ID：`{task_id}`\n"
+                f"- 状态：`{status}`\n"
+                f"- Request ID：`{request_id}`\n\n"
+                "正在自动查询生成结果..."
+            )
+            bubble.set_body(body)
+            result = await self._poll_async_result(task_id, bubble, label)
+            final_body = self._format_async_result(result, label) if result else (
+                body
+                + f"\n\n任务仍在处理中。稍后可输入 `/result {task_id}` 查询。"
+            )
+            bubble.set_body(final_body)
+            self.session.add_message("assistant", final_body)
+            self._save_state()
+            record = self._log_turn(user_text, final_body, command, None)
+            self.retrieval.upsert_turn(record)
+            self._refresh_sidebars()
+            self._refresh_status("任务已提交")
+        except GLMAPIError as exc:
+            bubble.set_body("生成任务提交失败：\n\n" + redact_secrets(str(exc)))
+            self._refresh_status("任务提交失败")
+
+    async def _cmd_result(self, args: str) -> None:
+        task_id = args.strip()
+        if not task_id:
+            await self._notice("用法：`/result 任务ID`。")
+            return
+        bubble = await self._notice(f"正在查询异步任务：`{task_id}` ...")
+        try:
+            data = await self.client.async_result(task_id)
+            bubble.set_body(self._format_async_result(data, "异步"))
+            self._refresh_status("查询完成")
+        except GLMAPIError as exc:
+            bubble.set_body("查询异步结果失败：\n\n" + redact_secrets(str(exc)))
+            self._refresh_status("查询失败")
+
+    async def _poll_async_result(
+        self,
+        task_id: str,
+        bubble: MessageBubble,
+        label: str,
+        attempts: int = 18,
+        delay: float = 5.0,
+    ) -> Optional[Dict[str, object]]:
+        if not task_id or task_id == "-":
+            return None
+        for index in range(attempts):
+            await asyncio.sleep(delay)
+            marker = self.activity_frames[index % len(self.activity_frames)]
+            bubble.set_body(f"{marker} {label}生成中，正在第 {index + 1}/{attempts} 次查询...\n\n任务 ID：`{task_id}`")
+            self._refresh_status("查询生成结果")
+            data = await self.client.async_result(task_id)
+            status = str(data.get("task_status") or data.get("status") or "").upper()
+            if status in {"SUCCESS", "FAIL", "FAILED"}:
+                return data
+            if data.get("image_result") or data.get("video_result") or data.get("choices"):
+                return data
+        return None
+
+    def _format_async_result(self, data: Dict[str, object], label: str) -> str:
+        task_id = str(data.get("id") or "-")
+        status = str(data.get("task_status") or data.get("status") or "-")
+        model = str(data.get("model") or "-")
+        request_id = str(data.get("request_id") or "-")
+        lines = [
+            f"## {label}任务结果",
+            "",
+            f"- 任务 ID：`{task_id}`",
+            f"- 模型：`{model}`",
+            f"- 状态：`{status}`",
+            f"- Request ID：`{request_id}`",
+        ]
+        image_result = data.get("image_result")
+        if isinstance(image_result, list) and image_result:
+            lines.extend(["", "### 图片结果"])
+            for index, item in enumerate(image_result, start=1):
+                if isinstance(item, dict):
+                    url = str(item.get("url") or item.get("image_url") or "")
+                    if url:
+                        lines.append(f"{index}. {url}")
+        video_result = data.get("video_result")
+        if isinstance(video_result, list) and video_result:
+            lines.extend(["", "### 视频结果"])
+            for index, item in enumerate(video_result, start=1):
+                if isinstance(item, dict):
+                    url = str(item.get("url") or "")
+                    cover = str(item.get("cover_image_url") or "")
+                    if url:
+                        lines.append(f"{index}. 视频：{url}")
+                    if cover:
+                        lines.append(f"   封面：{cover}")
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            lines.extend(["", "### 文本结果"])
+            for item in choices:
+                if not isinstance(item, dict):
+                    continue
+                message = item.get("message")
+                if isinstance(message, dict):
+                    content = str(message.get("content") or "").strip()
+                    if content:
+                        lines.append(content)
+        if len(lines) <= 6:
+            lines.append("")
+            lines.append("任务仍在处理中，稍后可再次使用 `/result 任务ID` 查询。")
+        return "\n".join(lines)
+
+    def _format_search_context(self, results: List[object]) -> str:
+        blocks = []
+        for index, item in enumerate(results[:8], start=1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "无标题")
+            content = str(item.get("content") or "")
+            link = str(item.get("link") or "")
+            media = str(item.get("media") or "")
+            publish_date = str(item.get("publish_date") or "")
+            blocks.append(
+                f"[{index}] {title}\n"
+                f"来源：{media or '-'} {publish_date or ''}\n"
+                f"链接：{link or '-'}\n"
+                f"摘要：{content[:1000]}"
+            )
+        return "\n\n".join(blocks)
+
+    def _format_search_results(self, results: List[object]) -> str:
+        lines = []
+        for index, item in enumerate(results[:8], start=1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "无标题")
+            link = str(item.get("link") or "")
+            media = str(item.get("media") or "")
+            publish_date = str(item.get("publish_date") or "")
+            content = str(item.get("content") or "")
+            meta = " · ".join(part for part in (media, publish_date) if part)
+            lines.append(
+                f"{index}. [{title}]({link})"
+                + (f"  \n   {meta}" if meta else "")
+                + (f"  \n   {content[:180]}" if content else "")
+            )
+        return "\n".join(lines)
 
     async def _cmd_add(self, args: str) -> None:
         if not args:

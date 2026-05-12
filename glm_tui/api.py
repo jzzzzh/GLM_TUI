@@ -5,11 +5,16 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional
+from uuid import uuid4
 
 import httpx
 
 
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+WEB_SEARCH_URL = "https://open.bigmodel.cn/api/paas/v4/web_search"
+IMAGE_GENERATION_URL = "https://open.bigmodel.cn/api/paas/v4/async/images/generations"
+VIDEO_GENERATION_URL = "https://open.bigmodel.cn/api/paas/v4/videos/generations"
+ASYNC_RESULT_URL = "https://open.bigmodel.cn/api/paas/v4/async-result"
 
 
 class GLMAPIError(RuntimeError):
@@ -189,6 +194,108 @@ class GLMClient:
         except httpx.HTTPError as exc:
             raise GLMAPIError(f"网络请求失败：{exc}") from exc
         yield StreamEvent(kind="done", usage=usage)
+
+    async def web_search(
+        self,
+        *,
+        query: str,
+        search_engine: str = "search_std",
+        count: int = 8,
+        search_intent: bool = False,
+        content_size: str = "medium",
+    ) -> Dict[str, Any]:
+        payload = {
+            "search_query": query[:70],
+            "search_engine": search_engine,
+            "search_intent": search_intent,
+            "count": max(1, min(count, 50)),
+            "content_size": content_size,
+            "request_id": "glm_tui_" + uuid4().hex,
+            "user_id": "glm_tui_user",
+        }
+        return await self._post_json(WEB_SEARCH_URL, payload, timeout=60)
+
+    async def generate_image(
+        self,
+        *,
+        prompt: str,
+        size: str = "1280x1280",
+        watermark_enabled: bool = True,
+    ) -> Dict[str, Any]:
+        payload = {
+            "model": "glm-image",
+            "prompt": prompt,
+            "quality": "hd",
+            "size": size,
+            "watermark_enabled": watermark_enabled,
+            "request_id": "glm_tui_" + uuid4().hex,
+            "user_id": "glm_tui_user",
+        }
+        return await self._post_json(IMAGE_GENERATION_URL, payload, timeout=60)
+
+    async def generate_video(
+        self,
+        *,
+        prompt: str,
+        size: str = "1280x720",
+        duration: int = 5,
+        fps: int = 30,
+        quality: str = "speed",
+        with_audio: bool = False,
+        watermark_enabled: bool = True,
+    ) -> Dict[str, Any]:
+        payload = {
+            "model": "cogvideox-3",
+            "prompt": prompt[:512],
+            "quality": quality,
+            "with_audio": with_audio,
+            "watermark_enabled": watermark_enabled,
+            "size": size,
+            "fps": fps,
+            "duration": duration,
+            "request_id": "glm_tui_" + uuid4().hex,
+            "user_id": "glm_tui_user",
+        }
+        return await self._post_json(VIDEO_GENERATION_URL, payload, timeout=60)
+
+    async def async_result(self, task_id: str) -> Dict[str, Any]:
+        safe_id = task_id.strip()
+        if not safe_id:
+            raise GLMAPIError("任务 ID 不能为空。")
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(f"{ASYNC_RESULT_URL}/{safe_id}", headers=self._headers())
+        except httpx.TimeoutException as exc:
+            raise GLMAPIError("查询异步结果超时：请稍后重试。") from exc
+        except httpx.HTTPError as exc:
+            raise GLMAPIError(f"网络请求失败：{exc}") from exc
+        if response.status_code >= 400:
+            raise GLMAPIError(explain_http_status(response.status_code, response.text))
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            raise GLMAPIError("服务返回了不可解析的 JSON。") from exc
+        if not isinstance(data, dict):
+            raise GLMAPIError("服务返回值必须是 JSON object。")
+        return data
+
+    async def _post_json(self, url: str, payload: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, headers=self._headers(), json=payload)
+        except httpx.TimeoutException as exc:
+            raise GLMAPIError("请求超时：请稍后重试。") from exc
+        except httpx.HTTPError as exc:
+            raise GLMAPIError(f"网络请求失败：{exc}") from exc
+        if response.status_code >= 400:
+            raise GLMAPIError(explain_http_status(response.status_code, response.text))
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            raise GLMAPIError("服务返回了不可解析的 JSON。") from exc
+        if not isinstance(data, dict):
+            raise GLMAPIError("服务返回值必须是 JSON object。")
+        return data
 
 
 def extract_json_payload(text: str) -> Dict[str, Any]:
