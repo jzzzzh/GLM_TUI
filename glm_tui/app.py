@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Dict, List, Optional
 
 from rich import box
@@ -19,7 +20,14 @@ from textual.widgets import Collapsible, Footer, Header, Input, Static
 
 from .api import GLMAPIError, GLMClient
 from .checkpoints import CheckpointStore
-from .commands import CommandSuggestion, command_suggestions, help_markdown, parse_input, resolve_command_name
+from .commands import (
+    REQUIRED_ARG_COMMANDS,
+    CommandSuggestion,
+    command_suggestions,
+    help_markdown,
+    parse_input,
+    resolve_command_name,
+)
 from .context import ContextFile, GrepHit, ProjectContext
 from .editing import EditError, EditPreview, apply_edit_plan, candidate_context, preview_edit_plan
 from .intent import Intent, classify_intent
@@ -375,6 +383,11 @@ class GLMTuiApp(App[None]):
                 command.name = resolved
             elif matches:
                 command.name = matches[index].command
+            if not command.args and command.name in REQUIRED_ARG_COMMANDS:
+                event.input.value = f"/{command.name} "
+                event.input.cursor_position = len(event.input.value)
+                self._update_command_hints(event.input.value)
+                return
             await self._run_command(command.name, command.args)
             return
         self._start_chat_task(text)
@@ -876,6 +889,7 @@ class GLMTuiApp(App[None]):
         bubble = await self._notice(f"正在查询异步任务：`{task_id}` ...")
         try:
             data = await self.client.async_result(task_id)
+            await self._download_async_assets(data, bubble)
             bubble.set_body(self._format_async_result(data, "异步"))
             self._refresh_status("查询完成")
         except GLMAPIError as exc:
@@ -900,10 +914,68 @@ class GLMTuiApp(App[None]):
             data = await self.client.async_result(task_id)
             status = str(data.get("task_status") or data.get("status") or "").upper()
             if status in {"SUCCESS", "FAIL", "FAILED"}:
+                await self._download_async_assets(data, bubble)
                 return data
             if data.get("image_result") or data.get("video_result") or data.get("choices"):
+                await self._download_async_assets(data, bubble)
                 return data
         return None
+
+    async def _download_async_assets(self, data: Dict[str, object], bubble: MessageBubble) -> None:
+        downloads: List[str] = []
+        tasks: List[tuple[str, str]] = []
+        image_result = data.get("image_result")
+        if isinstance(image_result, list):
+            for index, item in enumerate(image_result, start=1):
+                if isinstance(item, dict):
+                    url = str(item.get("url") or item.get("image_url") or "")
+                    if url:
+                        tasks.append((url, f"image-{index}"))
+        video_result = data.get("video_result")
+        if isinstance(video_result, list):
+            for index, item in enumerate(video_result, start=1):
+                if isinstance(item, dict):
+                    url = str(item.get("url") or "")
+                    cover = str(item.get("cover_image_url") or "")
+                    if url:
+                        tasks.append((url, f"video-{index}"))
+                    if cover:
+                        tasks.append((cover, f"cover-{index}"))
+        if not tasks:
+            data["_downloaded_files"] = downloads
+            return
+        download_dir = self.root / ".glm_tui" / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        task_id = str(data.get("id") or "task")
+        for url, label in tasks:
+            try:
+                bubble.set_body(f"正在下载生成结果：`{label}` ...")
+                content, content_type = await self.client.fetch_binary(url)
+                path = download_dir / self._download_filename(task_id, label, url, content_type)
+                path.write_bytes(content)
+                downloads.append(str(path.relative_to(self.root)))
+            except (GLMAPIError, OSError) as exc:
+                downloads.append(f"{label} 下载失败：{redact_secrets(str(exc))}")
+        data["_downloaded_files"] = downloads
+
+    def _download_filename(self, task_id: str, label: str, url: str, content_type: str) -> str:
+        suffix = Path(urlparse(url).path).suffix.lower()
+        if not suffix:
+            if "png" in content_type:
+                suffix = ".png"
+            elif "jpeg" in content_type or "jpg" in content_type:
+                suffix = ".jpg"
+            elif "webp" in content_type:
+                suffix = ".webp"
+            elif "mp4" in content_type:
+                suffix = ".mp4"
+            elif "video" in content_type:
+                suffix = ".mp4"
+            else:
+                suffix = ".bin"
+        safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id)[:80]
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)[:40]
+        return f"{safe_task}-{safe_label}{suffix}"
 
     def _format_async_result(self, data: Dict[str, object], label: str) -> str:
         task_id = str(data.get("id") or "-")
@@ -937,6 +1009,11 @@ class GLMTuiApp(App[None]):
                         lines.append(f"{index}. 视频：{url}")
                     if cover:
                         lines.append(f"   封面：{cover}")
+        downloaded = data.get("_downloaded_files")
+        if isinstance(downloaded, list) and downloaded:
+            lines.extend(["", "### 已下载到本地"])
+            for item in downloaded:
+                lines.append(f"- `{item}`")
         choices = data.get("choices")
         if isinstance(choices, list) and choices:
             lines.extend(["", "### 文本结果"])

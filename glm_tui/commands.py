@@ -65,6 +65,18 @@ COMMAND_HELP = [
 ]
 
 COMMAND_NAMES = [item[0].split()[0][1:] for item in COMMAND_HELP]
+REQUIRED_ARG_COMMANDS = {
+    "search",
+    "image",
+    "video",
+    "result",
+    "add",
+    "read",
+    "grep",
+    "skill",
+    "remember",
+    "forget",
+}
 
 
 def parse_input(text: str) -> Optional[ParsedCommand]:

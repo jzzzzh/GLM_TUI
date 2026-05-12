@@ -279,6 +279,18 @@ class GLMClient:
             raise GLMAPIError("服务返回值必须是 JSON object。")
         return data
 
+    async def fetch_binary(self, url: str) -> tuple[bytes, str]:
+        try:
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                response = await client.get(url)
+        except httpx.TimeoutException as exc:
+            raise GLMAPIError("下载生成结果超时：请稍后重试。") from exc
+        except httpx.HTTPError as exc:
+            raise GLMAPIError(f"下载生成结果失败：{exc}") from exc
+        if response.status_code >= 400:
+            raise GLMAPIError(explain_http_status(response.status_code, response.text))
+        return response.content, response.headers.get("content-type", "")
+
     async def _post_json(self, url: str, payload: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
